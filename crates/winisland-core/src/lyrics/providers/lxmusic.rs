@@ -65,16 +65,42 @@ fn parse_word_lyrics(word_lyrics: &str, translation: &str) -> Option<Vec<LyricLi
     if !word_lyrics.contains('<') {
         return None;
     }
-    let translations = parse_lyrics(translation, "")
-        .into_iter()
-        .filter(|line| !line.text.trim().is_empty())
-        .map(|line| (line.time_ms, line.text))
-        .collect::<BTreeMap<_, _>>();
+    let translations = parse_translation_lines(translation);
     let lines = word_lyrics
         .lines()
         .filter_map(|line| parse_word_line(line, &translations))
         .collect::<Vec<_>>();
     (!lines.is_empty()).then_some(lines)
+}
+
+/// Builds the translation lookup for word-synced lines.
+///
+/// `parse_lyrics` normalizes timestamps to centiseconds, which then no longer matches the
+/// millisecond times the word-synced lines carry, so the timestamps are read here directly.
+/// `//` is what LX Music reports for a line it holds no translation for.
+fn parse_translation_lines(translation: &str) -> BTreeMap<u64, String> {
+    let mut translations = BTreeMap::new();
+    for line in translation.lines() {
+        let Some(line) = line.trim().strip_prefix('[') else {
+            continue;
+        };
+        let Some(header_end) = line.find(']') else {
+            continue;
+        };
+        let Some(time_ms) = line.get(..header_end).and_then(parse_lrc_timestamp) else {
+            continue;
+        };
+        let Some(text) = line.get(header_end + 1..).map(str::trim) else {
+            continue;
+        };
+        if text.is_empty() || text == "//" {
+            continue;
+        }
+        translations
+            .entry(time_ms)
+            .or_insert_with(|| text.to_string());
+    }
+    translations
 }
 
 fn parse_word_line(line: &str, translations: &BTreeMap<u64, String>) -> Option<LyricLine> {
