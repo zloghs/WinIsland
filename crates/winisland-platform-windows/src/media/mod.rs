@@ -180,8 +180,10 @@ impl MediaSessionHandle for WindowsMediaSession {
         let position = match props.LastUpdatedTime() {
             Ok(updated) if self.is_playing() => {
                 let advanced = position.saturating_add(elapsed_ticks(updated.UniversalTime));
-                if end > start && advanced > end {
-                    position
+                // Clamping keeps the estimate monotonic: falling back to the stale last published
+                // position would make the bar jump backwards near the end of a track.
+                if end > start {
+                    advanced.min(end)
                 } else {
                     advanced
                 }
@@ -280,15 +282,20 @@ fn timeline_from_ticks(
     }
 }
 
-/// Ticks elapsed since a `DateTime` value, zero when it lies in the future.
+/// Ticks elapsed since a `DateTime` value, zero when it lies in the future or is unset.
 fn elapsed_ticks(universal_time: i64) -> i64 {
     const UNIX_EPOCH_TICKS: u128 = 116_444_736_000_000_000;
     const MAX_ELAPSED_TICKS: u128 = 12 * 60 * 60 * 10_000_000;
+    // A player that never publishes `LastUpdatedTime` leaves it at zero, which would otherwise be
+    // read as 1601 and saturate the clamp below into a bogus twelve hour jump.
+    if universal_time <= 0 {
+        return 0;
+    }
     let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
         return 0;
     };
     let now = now.as_nanos() / 100 + UNIX_EPOCH_TICKS;
-    let updated = u128::try_from(universal_time).unwrap_or(0);
+    let updated = universal_time as u128;
     i64::try_from(now.saturating_sub(updated).min(MAX_ELAPSED_TICKS)).unwrap_or(0)
 }
 
