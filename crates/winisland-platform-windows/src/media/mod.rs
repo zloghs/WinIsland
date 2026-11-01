@@ -171,12 +171,29 @@ impl MediaSessionHandle for WindowsMediaSession {
 
     fn timeline(&self) -> Option<Timeline> {
         let props = self.0.GetTimelineProperties().ok()?;
+        let start = props.StartTime().map_or(0, |value| value.Duration);
+        let end = props.EndTime().map_or(0, |value| value.Duration);
+        // `Position` describes the point `LastUpdatedTime` refers to, and players publish it far
+        // less often than they play, so reading it as the present puts a track that was already
+        // running back at the moment it was last published.
+        let position = props.Position().map_or(0, |value| value.Duration);
+        let position = match props.LastUpdatedTime() {
+            Ok(updated) if self.is_playing() => {
+                let advanced = position.saturating_add(elapsed_ticks(updated.UniversalTime));
+                if end > start && advanced > end {
+                    position
+                } else {
+                    advanced
+                }
+            }
+            _ => position,
+        };
         Some(timeline_from_ticks(
-            props.StartTime().map_or(0, |value| value.Duration),
-            props.EndTime().map_or(0, |value| value.Duration),
+            start,
+            end,
             props.MinSeekTime().map_or(0, |value| value.Duration),
             props.MaxSeekTime().map_or(0, |value| value.Duration),
-            props.Position().map_or(0, |value| value.Duration),
+            position,
         ))
     }
 
@@ -261,6 +278,18 @@ fn timeline_from_ticks(
         duration: Duration::from_millis(((boundary - start) / 10_000) as u64),
         duration_source,
     }
+}
+
+/// Ticks elapsed since a `DateTime` value, zero when it lies in the future.
+fn elapsed_ticks(universal_time: i64) -> i64 {
+    const UNIX_EPOCH_TICKS: u128 = 116_444_736_000_000_000;
+    const MAX_ELAPSED_TICKS: u128 = 12 * 60 * 60 * 10_000_000;
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return 0;
+    };
+    let now = now.as_nanos() / 100 + UNIX_EPOCH_TICKS;
+    let updated = u128::try_from(universal_time).unwrap_or(0);
+    i64::try_from(now.saturating_sub(updated).min(MAX_ELAPSED_TICKS)).unwrap_or(0)
 }
 
 fn read_string(value: windows::core::Result<windows::core::HSTRING>) -> String {
