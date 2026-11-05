@@ -21,6 +21,12 @@ const FAST_THUMBNAIL_RETRY_DELAY: Duration = Duration::from_millis(300);
 const THUMBNAIL_RETRY_DELAY: Duration = Duration::from_millis(500);
 const SEEK_CONFIRM_TOLERANCE_MS: u64 = 1_500;
 const TIMELINE_DRIFT_THRESHOLD_MS: u64 = 2_000;
+/// How far the published position may trail the extrapolated one and still count as the player's
+/// publishing lag instead of a seek. A player that publishes its timeline slower than it plays
+/// reports a position a little behind the current one on every poll; that must not pull playback
+/// back. A seek is told apart by the published position moving relative to the previous publish,
+/// not by the distance alone, so a short rewind stays a seek.
+const PLAYER_LAG_TOLERANCE_MS: u64 = 5_000;
 const SEEK_RANGE_STABILITY: Duration = Duration::from_secs(1);
 const MAX_OBSERVED_DURATIONS: usize = 64;
 static NEXT_TRACK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -532,7 +538,8 @@ fn sync_timeline(
     } else {
         info.position_ms
     };
-    let timeline_changed = timeline.position_ms != info.last_smtc_pos;
+    let previous_published = info.last_smtc_pos;
+    let timeline_changed = timeline.position_ms != previous_published;
     let drift_ms = timeline.position_ms.abs_diff(current_position);
     let had_seek_guard = !track_changed && info.seek_guard_until.is_some();
     let mut seek_guard_active = had_seek_guard
@@ -559,11 +566,38 @@ fn sync_timeline(
     if !should_sync || seek_guard_active {
         return false;
     }
+    // A player that republishes its timeline slower than it plays keeps reporting a position from
+    // its last update. Accepting that as the present drags playback back by the report interval on
+    // every poll, which shows up as lyrics jumping back and replaying the same lines. A position
+    // that moved backwards relative to the one published last is a seek instead, and has to be
+    // followed, or a short rewind in the player would leave the island ahead for the whole track.
+    if update.is_playing
+        && !track_changed
+        && is_player_lag(current_position, timeline.position_ms, previous_published)
+    {
+        return false;
+    }
     if timeline.position_ms > 0 || !track_changed {
         info.position_ms = timeline.position_ms;
     }
     info.last_update = Instant::now();
     true
+}
+
+/// Whether the published position is the same timeline as last time, only further behind the
+/// extrapolated one.
+///
+/// The estimate advances between two polls, so a player that publishes slower than it plays
+/// reports a position below the estimate while its own published position keeps moving forward.
+/// A rewind moves the published position backwards; that is a seek, even when it is small.
+fn is_player_lag(
+    current_position: u64,
+    published_position: u64,
+    previously_published: u64,
+) -> bool {
+    published_position < current_position
+        && current_position - published_position <= PLAYER_LAG_TOLERANCE_MS
+        && published_position >= previously_published
 }
 
 fn update_playback_state(
@@ -738,4 +772,36 @@ fn thumbnail_request_is_current(
     current.track_id == request.track_id
         && current.source_app_id == request.source_app_id
         && current.thumbnail.is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PLAYER_LAG_TOLERANCE_MS, is_player_lag};
+
+    #[test]
+    fn a_player_publishing_slower_than_it_plays_is_lag() {
+        assert!(is_player_lag(60_500, 60_000, 59_500));
+    }
+
+    #[test]
+    fn a_tolerance_wide_trail_is_still_lag() {
+        let current = 60_000 + PLAYER_LAG_TOLERANCE_MS;
+        assert!(is_player_lag(current, 60_000, 59_000));
+    }
+
+    #[test]
+    fn a_rewind_inside_the_tolerance_is_not_lag() {
+        assert!(!is_player_lag(60_500, 57_000, 60_000));
+    }
+
+    #[test]
+    fn a_forward_publish_is_not_lag() {
+        assert!(!is_player_lag(60_000, 60_300, 59_800));
+    }
+
+    #[test]
+    fn a_trail_wider_than_the_tolerance_is_not_lag() {
+        let current = 60_000 + PLAYER_LAG_TOLERANCE_MS + 1;
+        assert!(!is_player_lag(current, 60_000, 55_000));
+    }
 }
