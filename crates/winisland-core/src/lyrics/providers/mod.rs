@@ -13,13 +13,18 @@ use serde_json::Value;
 
 use super::LyricLine;
 use crate::config::{APP_HOMEPAGE, APP_VERSION};
+pub(super) use matching::artist_matches;
 use matching::{SongQuery, ranked};
 
 pub(super) const MOZILLA_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 
+/// Every source is asked up to three times and then the fallback chain starts, so one stalled
+/// request has to give up quickly instead of holding the whole chain for ten seconds.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(REQUEST_TIMEOUT)
         .build()
         .unwrap()
 });
@@ -57,10 +62,6 @@ pub(super) fn fallback_sources(source: &str) -> &'static [&'static str] {
 
 pub(super) async fn get_json(url: &str, user_agent: &str) -> Option<Value> {
     get_json_request(HTTP_CLIENT.get(url).header("User-Agent", user_agent)).await
-}
-
-pub(super) async fn get_json_with_timeout(url: &str, timeout: Duration) -> Option<Value> {
-    get_json_request(HTTP_CLIENT.get(url).timeout(timeout)).await
 }
 
 pub(super) async fn get_json_with_referer(

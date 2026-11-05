@@ -1,18 +1,20 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{SongQuery, get_json_with_timeout};
-use crate::lyrics::{LyricLine, LyricTiming, parse_lrc_timestamp, parse_lyrics};
+use super::{SongQuery, artist_matches, get_json, winisland_ua};
+use crate::lyrics::{
+    LyricLine, LyricTiming, MatchKey, lrc_metadata_value, parse_lrc_timestamp, parse_lyrics,
+};
 
 /// The LX Music open API listens on localhost only and answers for whatever that player is
-/// playing, so the whole source is a single request with a timeout short enough to fall back
-/// quickly when the feature is off or another player owns the session.
+/// playing. It shares the three second request budget every source gets, so a disabled feature or
+/// another owner falls back quickly; the caller retries twice because the player publishes a
+/// track before it loads that track's lyrics.
 const STATUS_URL: &str =
     "http://127.0.0.1:23330/status?filter=name,singer,duration,lyric,tlyric,lxlyric";
-const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+const HEADER_SCAN_LINES: usize = 32;
 
 pub(super) async fn fetch(
     title: &str,
@@ -20,7 +22,7 @@ pub(super) async fn fetch(
     duration_secs: u64,
     fuzzy: bool,
 ) -> Option<Arc<Vec<LyricLine>>> {
-    let status = get_json_with_timeout(STATUS_URL, STATUS_TIMEOUT).await?;
+    let status = get_json(STATUS_URL, &winisland_ua()).await?;
     let name = status.get("name").and_then(Value::as_str)?.trim();
     let singer = status
         .get("singer")
@@ -45,16 +47,89 @@ pub(super) async fn fetch(
         .get("lxlyric")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let lyric = status
+        .get("lyric")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    // The player swaps in the next song's metadata before it loads that song's lyrics, so a read
+    // taken right after a track change still carries the previous track's body. A header naming
+    // the body's own song is the cheapest evidence and is checked here; bodies without one are
+    // caught by the shared freshness check every source goes through.
+    let (body_title, body_artist) = lyric_header([word_lyrics, lyric]);
+    if !body_matches_song(body_title, body_artist, name, singer) {
+        log::warn!(
+            "Lyrics: LX Music answered '{name}' - '{singer}' with the lyrics of '{}'",
+            body_title.unwrap_or_default()
+        );
+        return None;
+    }
+
     if let Some(lines) = parse_word_lyrics(word_lyrics, translation) {
         return Some(Arc::new(lines));
     }
 
-    let lyric = status
-        .get("lyric")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())?;
+    let lyric = lyric.trim();
+    if lyric.is_empty() {
+        return None;
+    }
     let lines = parse_lyrics(lyric, translation);
     (!lines.is_empty()).then(|| Arc::new(lines))
+}
+
+/// Reads the `[ti:]`/`[ar:]` header a lyric payload carries for the song it belongs to. Both the
+/// word-synced and the plain body can carry one, so they are read in the order the caller parses
+/// them.
+fn lyric_header(bodies: [&str; 2]) -> (Option<&str>, Option<&str>) {
+    for body in bodies {
+        let mut title = None;
+        let mut artist = None;
+        for line in body.lines().take(HEADER_SCAN_LINES) {
+            let line = line.trim().trim_start_matches('\u{feff}');
+            if title.is_none() {
+                title = lrc_metadata_value(line, "ti");
+            }
+            if artist.is_none() {
+                artist = lrc_metadata_value(line, "ar");
+            }
+            if title.is_some() && artist.is_some() {
+                break;
+            }
+        }
+        if title.is_some() || artist.is_some() {
+            return (title, artist);
+        }
+    }
+    (None, None)
+}
+
+/// Only a header naming another song proves the body is stale; a body without a header cannot be
+/// checked, so it is kept.
+fn body_matches_song(
+    body_title: Option<&str>,
+    body_artist: Option<&str>,
+    name: &str,
+    singer: &str,
+) -> bool {
+    match (body_title, body_artist) {
+        (Some(body_title), _) => titles_agree(body_title, name),
+        (None, Some(body_artist)) => {
+            singer.trim().is_empty() || artist_matches(singer, body_artist)
+        }
+        (None, None) => true,
+    }
+}
+
+/// A media session title and a lyric header often differ in bracketed edition suffixes, script,
+/// or punctuation, so two titles only count as different songs when they share nothing.
+fn titles_agree(left: &str, right: &str) -> bool {
+    let left = MatchKey::new(left);
+    let right = MatchKey::new(right);
+    left.compact.is_empty()
+        || right.compact.is_empty()
+        || left.matches(&right)
+        || left.simplified_compact.contains(&right.simplified_compact)
+        || right.simplified_compact.contains(&left.simplified_compact)
 }
 
 /// Parses LX Music word-synced lyrics, where every word carries its offset and duration relative

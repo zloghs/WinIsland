@@ -495,7 +495,12 @@ fn enrich_current_track(
     let mut changed = false;
     if info.artist.is_empty() && !metadata.artist.is_empty() {
         info.artist.clone_from(&metadata.artist);
-        queue_lyrics(info, requests);
+        // The artist is only used to match the track, so a body that was already fetched for it
+        // stays valid. Asking again would hand out the same body, which the freshness check would
+        // then read as the previous track's.
+        if info.lyrics.is_none() {
+            queue_lyrics(info, requests);
+        }
         changed = true;
     }
     if info.album.is_empty() && !metadata.album.is_empty() {
