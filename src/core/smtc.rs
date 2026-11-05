@@ -15,6 +15,11 @@ pub mod sessions;
 mod worker;
 
 const SEEK_GUARD_DURATION: Duration = Duration::from_secs(4);
+/// Every source is asked up to three times before the fallback providers are involved: one request
+/// plus two retries. A source can still be holding the previous track's lyrics right after a track
+/// change, and a request can fail for a momentary network reason.
+const ONLINE_LYRICS_ATTEMPTS: usize = 3;
+const ONLINE_LYRICS_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 pub(crate) fn detect_active_apps_async() -> Job<Vec<String>> {
     Job::spawn_named("winisland-smtc-settings", || {
@@ -366,6 +371,30 @@ impl LyricsFetchRequest {
     }
 }
 
+/// Asks the configured source before the fallback providers are involved. The first answers after
+/// a track change can still belong to the previous track, so the source is asked again before it is
+/// given up on; the last attempt is the one allowed to start the fallback chain.
+async fn fetch_online_with_retry(request: &LyricsFetchRequest) -> Option<Arc<Vec<LyricLine>>> {
+    for attempt in 0..ONLINE_LYRICS_ATTEMPTS {
+        let final_attempt = attempt + 1 == ONLINE_LYRICS_ATTEMPTS;
+        if let Some(lyrics) = fetch_online_lyrics(
+            &request.title,
+            &request.artist,
+            request.duration_secs,
+            &request.source,
+            final_attempt,
+        )
+        .await
+        {
+            return Some(lyrics);
+        }
+        if !final_attempt {
+            tokio::time::sleep(ONLINE_LYRICS_RETRY_DELAY).await;
+        }
+    }
+    None
+}
+
 pub(super) fn spawn_lyrics_fetch(
     info_tx: &watch::Sender<MediaInfo>,
     request: LyricsFetchRequest,
@@ -397,13 +426,7 @@ pub(super) fn spawn_lyrics_fetch(
                     None => None,
                 }
             } else {
-                fetch_online_lyrics(
-                    &request.title,
-                    &request.artist,
-                    request.duration_secs,
-                    &request.source,
-                )
-                .await
+                fetch_online_with_retry(&request).await
             };
             match (lyrics, lyrics_bridge) {
                 (Some(lyrics), Some(bridge)) => {

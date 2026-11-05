@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use encoding_rs::GBK;
 use fuzzengine::{PreprocessingOptions, partial_ratio, partial_token_set_ratio};
@@ -488,43 +490,173 @@ pub fn load_local_lyrics(
     fetch_lyrics_local(title, artist, local_dir).map(simplify_lyrics_for_chinese_ui)
 }
 
+/// The body handed out for the previous track. A source that has not caught up with a track change
+/// serves the same body under the new song's name, which identifies it even when the body carries
+/// no header naming its own song.
+static LAST_ACCEPTED_BODY: Mutex<Option<AcceptedBody>> = Mutex::new(None);
+
+struct AcceptedBody {
+    title: MatchKey,
+    artist: String,
+    digest: u64,
+}
+
+/// A body may stop before the track does: lyric files often leave the outro out, and players
+/// report a duration a few seconds off the file, so a body ending this close to the end still
+/// belongs to the track.
+const BODY_END_TOLERANCE_MS: u64 = 5_000;
+/// A body whose last line falls further than this behind the reported duration belongs to a
+/// shorter song. A missing outro stays well inside the window; a three minute body shown against a
+/// six minute track does not.
+const BODY_END_SHORTFALL_MS: u64 = 90_000;
+
 pub async fn fetch_online_lyrics(
     title: &str,
     artist: &str,
     duration_secs: u64,
     source: &str,
+    allow_fallback: bool,
 ) -> Option<Arc<Vec<LyricLine>>> {
     if title.is_empty() {
         return None;
     }
 
     log::info!("Lyrics: fetching '{title}' - '{artist}' from source '{source}'");
-    if let Some(lyrics) = providers::fetch(source, title, artist, duration_secs).await {
-        let word_synced = lyrics.iter().filter(|line| line.is_word_synced()).count();
-        log::info!(
-            "Lyrics: source '{source}' succeeded ({} lines, {word_synced} word-synced)",
-            lyrics.len()
-        );
-        log::logger().flush();
-        return Some(simplify_lyrics_for_chinese_ui(lyrics));
+    if let Some(lyrics) = fetch_checked(source, title, artist, duration_secs).await {
+        return Some(lyrics);
+    }
+    if !allow_fallback {
+        // The caller asks the source again before the other providers are involved, so a source
+        // that has not caught up with a track change is not abandoned on its first answer.
+        log::debug!("Lyrics: source '{source}' has nothing for '{title}' - '{artist}' yet");
+        return None;
     }
     log::warn!(
         "Lyrics: source '{source}' returned no lyrics for '{title}' - '{artist}', starting fallback"
     );
     for fallback_source in providers::fallback_sources(source) {
         log::info!("Lyrics: trying fallback source '{fallback_source}'");
-        if let Some(lyrics) = providers::fetch(fallback_source, title, artist, duration_secs).await
-        {
-            let word_synced = lyrics.iter().filter(|line| line.is_word_synced()).count();
+        if let Some(lyrics) = fetch_checked(fallback_source, title, artist, duration_secs).await {
             log::warn!(
-                "Lyrics: fallback source '{fallback_source}' succeeded ({} lines, {word_synced} word-synced)",
+                "Lyrics: fallback source '{fallback_source}' succeeded ({} lines)",
                 lyrics.len()
             );
             log::logger().flush();
-            return Some(simplify_lyrics_for_chinese_ui(lyrics));
+            return Some(lyrics);
         }
     }
     None
+}
+
+/// Asks one source and only hands the answer on when it belongs to the requested track. Every
+/// source goes through here: the configured one and each fallback alike.
+async fn fetch_checked(
+    source: &str,
+    title: &str,
+    artist: &str,
+    duration_secs: u64,
+) -> Option<Arc<Vec<LyricLine>>> {
+    let mut lyrics = providers::fetch(source, title, artist, duration_secs).await?;
+    // The island picks the line covering the current position with a binary search, so the lines
+    // have to be ordered by time. `parse_lyrics` already collects them in a `BTreeMap`, but a
+    // word-synced body is parsed in file order, which a source is free to write differently.
+    Arc::make_mut(&mut lyrics).sort_by_key(|line| line.time_ms);
+    if repeats_previous_track(&lyrics, title, artist) {
+        log::warn!(
+            "Lyrics: source '{source}' served the body already used for the previous track of '{title}' - '{artist}'"
+        );
+        log::logger().flush();
+        return None;
+    }
+    if ends_far_from_duration(&lyrics, duration_secs) {
+        log::warn!(
+            "Lyrics: source '{source}' returned lyrics that do not fit the {duration_secs} s track '{title}' - '{artist}'"
+        );
+        log::logger().flush();
+        return None;
+    }
+    let word_synced = lyrics.iter().filter(|line| line.is_word_synced()).count();
+    log::info!(
+        "Lyrics: source '{source}' succeeded ({} lines, {word_synced} word-synced)",
+        lyrics.len()
+    );
+    log::logger().flush();
+    remember_accepted_body(&lyrics, title, artist);
+    Some(simplify_lyrics_for_chinese_ui(lyrics))
+}
+
+/// The same body cannot belong to two different tracks: when a source names another song but
+/// hands out the body that was already accepted for the previous one, that body is stale.
+fn repeats_previous_track(lyrics: &[LyricLine], title: &str, artist: &str) -> bool {
+    let digest = body_digest(lyrics);
+    let title = MatchKey::new(title);
+    LAST_ACCEPTED_BODY
+        .lock()
+        .map(|slot| {
+            slot.as_ref().is_some_and(|previous| {
+                previous.digest == digest && names_another_song(previous, &title, artist)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Whether the request names a different track than the one the accepted body was fetched for.
+///
+/// A player refines a track's metadata while it starts: an artist that was still empty gets
+/// filled in, and a featured artist can be appended. That is the same song, so the body is not the
+/// previous track's body, and the check has to ignore it; only a different title, or two different
+/// artists, means the source handed out another track's lyrics.
+fn names_another_song(previous: &AcceptedBody, title: &MatchKey, artist: &str) -> bool {
+    if !previous.title.matches(title) {
+        return true;
+    }
+    !previous.artist.trim().is_empty()
+        && !artist.trim().is_empty()
+        && !providers::artist_matches(&previous.artist, artist)
+}
+
+/// Whether the last line of the body falls outside the span the reported duration allows.
+fn ends_far_from_duration(lyrics: &[LyricLine], duration_secs: u64) -> bool {
+    let Some(last_ms) = last_timed_line_ms(lyrics) else {
+        return false;
+    };
+    let Some(duration_ms) = duration_secs.checked_mul(1_000).filter(|value| *value > 0) else {
+        return false;
+    };
+    last_ms > duration_ms.saturating_add(BODY_END_TOLERANCE_MS)
+        || last_ms.saturating_add(BODY_END_SHORTFALL_MS) < duration_ms
+}
+
+/// Latest timestamp that carries text. A lyric file often ends with an empty timed line that only
+/// clears the display, and that line says nothing about how long the song is.
+fn last_timed_line_ms(lyrics: &[LyricLine]) -> Option<u64> {
+    lyrics
+        .iter()
+        .filter(|line| !line.text.trim().is_empty())
+        .map(|line| line.time_ms)
+        .max()
+}
+
+fn remember_accepted_body(lyrics: &[LyricLine], title: &str, artist: &str) {
+    if let Ok(mut slot) = LAST_ACCEPTED_BODY.lock() {
+        *slot = Some(AcceptedBody {
+            title: MatchKey::new(title),
+            artist: artist.to_string(),
+            digest: body_digest(lyrics),
+        });
+    }
+}
+
+/// Identifies the timed text of a body so two answers can be compared without keeping the body
+/// around.
+fn body_digest(lyrics: &[LyricLine]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    lyrics.len().hash(&mut hasher);
+    for line in lyrics {
+        line.time_ms.hash(&mut hasher);
+        line.text.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn simplify_lyrics_for_chinese_ui(mut lyrics: Arc<Vec<LyricLine>>) -> Arc<Vec<LyricLine>> {
@@ -752,5 +884,120 @@ fn normalize_lrc_timestamps(content: &str) -> String {
     } else {
         output.push_str(&content[copied_until..]);
         output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AcceptedBody, LyricLine, MatchKey, body_digest, ends_far_from_duration, last_timed_line_ms,
+        names_another_song,
+    };
+
+    fn line(time_ms: u64, text: &str) -> LyricLine {
+        LyricLine {
+            time_ms,
+            text: text.to_owned(),
+            secondary_text: None,
+            timings: Vec::new(),
+        }
+    }
+
+    fn accepted(title: &str, artist: &str) -> AcceptedBody {
+        AcceptedBody {
+            title: MatchKey::new(title),
+            artist: artist.to_owned(),
+            digest: 0,
+        }
+    }
+
+    #[test]
+    fn a_body_that_ends_near_the_duration_belongs_to_the_track() {
+        let body = [line(12_000, "first"), line(220_000, "last")];
+        assert!(!ends_far_from_duration(&body, 3 * 60 + 45));
+    }
+
+    #[test]
+    fn a_missing_outro_is_still_accepted() {
+        let body = [line(12_000, "first"), line(250_000, "last")];
+        assert!(!ends_far_from_duration(&body, 5 * 60));
+    }
+
+    #[test]
+    fn a_body_from_a_shorter_track_is_rejected() {
+        let body = [line(12_000, "first"), line(190_000, "last")];
+        assert!(ends_far_from_duration(&body, 6 * 60));
+    }
+
+    #[test]
+    fn a_body_ending_after_the_track_is_rejected() {
+        let body = [line(12_000, "first"), line(310_000, "last")];
+        assert!(ends_far_from_duration(&body, 3 * 60));
+    }
+
+    #[test]
+    fn an_empty_timed_line_does_not_extend_the_body() {
+        let body = [
+            line(12_000, "first"),
+            line(200_000, "last"),
+            line(400_000, ""),
+        ];
+        assert_eq!(last_timed_line_ms(&body), Some(200_000));
+        assert!(!ends_far_from_duration(&body, 250));
+    }
+
+    #[test]
+    fn a_body_without_a_known_duration_cannot_be_measured() {
+        let body = [line(12_000, "first")];
+        assert!(!ends_far_from_duration(&body, 0));
+    }
+
+    #[test]
+    fn the_same_body_has_the_same_digest() {
+        let first = [line(1_000, "a"), line(2_000, "b")];
+        let second = [line(1_000, "a"), line(2_000, "b")];
+        let other = [line(1_000, "a"), line(2_000, "c")];
+        assert_eq!(body_digest(&first), body_digest(&second));
+        assert_ne!(body_digest(&first), body_digest(&other));
+    }
+
+    #[test]
+    fn a_filled_in_artist_still_names_the_same_song() {
+        let previous = accepted("晴天", "");
+        assert!(!names_another_song(
+            &previous,
+            &MatchKey::new("晴天"),
+            "周杰伦"
+        ));
+    }
+
+    #[test]
+    fn an_appended_featured_artist_still_names_the_same_song() {
+        let previous = accepted("Song", "Artist");
+        assert!(!names_another_song(
+            &previous,
+            &MatchKey::new("Song"),
+            "Artist & Guest"
+        ));
+    }
+
+    #[test]
+    fn a_different_title_names_another_song() {
+        let previous = accepted("晴天", "周杰伦");
+        assert!(names_another_song(
+            &previous,
+            &MatchKey::new("七里香"),
+            "周杰伦"
+        ));
+    }
+
+    #[test]
+    fn a_different_artist_names_another_song() {
+        let previous = accepted("Song", "Artist");
+        assert!(names_another_song(
+            &previous,
+            &MatchKey::new("Song"),
+            "Other"
+        ));
     }
 }

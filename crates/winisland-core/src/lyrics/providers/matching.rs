@@ -132,7 +132,7 @@ pub(super) fn ranked<'a>(
         .collect()
 }
 
-pub(super) fn artist_matches(expected: &str, candidate: &str) -> bool {
+pub(crate) fn artist_matches(expected: &str, candidate: &str) -> bool {
     let expected_key = MatchKey::new(expected);
     let candidate_key = MatchKey::new(candidate);
     if expected_key.compact.is_empty() || candidate_key.compact.is_empty() {
