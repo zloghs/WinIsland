@@ -985,7 +985,8 @@ impl App {
     }
 
     fn update_lyrics(&mut self, window: &WindowRef, music_active: bool, is_paused: bool, dt: f32) {
-        let current_lyric = if music_active && self.config.show_lyrics && !is_paused {
+        let lyrics_enabled = music_active && self.config.show_lyrics;
+        let current_lyric = if lyrics_enabled && !is_paused {
             self.current_media_info()
                 .current_lyric(
                     (self.config.lyrics_delay * 1000.0) as i64,
@@ -1018,7 +1019,25 @@ impl App {
                 self.lyrics.highlight = highlight;
                 window.request_redraw();
             }
-        } else if !is_paused && !self.lyrics.current_text.is_empty() {
+        } else if lyrics_enabled && (!is_paused || self.lyrics.current_text.is_empty()) {
+            // No line covers the current position: the fetch is still running, the track has no
+            // lyrics, or the intro has not reached the first line. The title keeps the slot
+            // filled, and the first line replaces it, keeping the normal entrance animation.
+            let title = self.current_media_info().title.clone();
+            if !title.is_empty() && title != self.lyrics.current_text {
+                self.lyrics.transition_to(
+                    title,
+                    String::new(),
+                    None,
+                    true,
+                    self.config.lyrics_transition_animation,
+                );
+                window.request_redraw();
+            }
+        } else if (!is_paused || !lyrics_enabled) && !self.lyrics.current_text.is_empty() {
+            // Pausing leaves the frozen line on screen, but turning lyrics off (or losing the
+            // session) must clear it even while paused; otherwise the old line stays on the
+            // island with no way to remove it.
             self.lyrics.transition_to(
                 String::new(),
                 String::new(),
