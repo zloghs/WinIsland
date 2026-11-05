@@ -136,6 +136,7 @@ pub struct AppConfig {
         "kugou" => "lyrics_source_kugou",
         "lrclib" => "lyrics_source_lrclib",
         "amll" => "AMLL",
+        "lxmusic" => "LX Music",
     ))]
     pub lyrics_source: String,
     #[setting(number(min = -10.0, max = 10.0, step = 0.1, precision = 1))]

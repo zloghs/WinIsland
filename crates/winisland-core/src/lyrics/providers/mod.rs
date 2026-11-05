@@ -1,11 +1,13 @@
 mod amll;
 mod kugou;
 mod lrclib;
+mod lxmusic;
 mod matching;
 mod netease;
 mod qq;
 
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -17,7 +19,7 @@ pub(super) const MOZILLA_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) A
 
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(Duration::from_secs(10))
         .build()
         .unwrap()
 });
@@ -37,6 +39,7 @@ pub(super) async fn fetch(
         "qq" => qq::fetch(title, artist, duration_secs, fuzzy).await,
         "kugou" => kugou::fetch(title, artist, duration_secs, fuzzy).await,
         "lrclib" => lrclib::fetch(title, artist, duration_secs, fuzzy).await,
+        "lxmusic" => lxmusic::fetch(title, artist, duration_secs, fuzzy).await,
         _ => netease::fetch(title, artist, duration_secs, fuzzy).await,
     }
 }
@@ -47,12 +50,17 @@ pub(super) fn fallback_sources(source: &str) -> &'static [&'static str] {
         "qq" => &["163", "kugou", "lrclib", "amll"],
         "kugou" => &["163", "lrclib", "qq", "amll"],
         "lrclib" => &["163", "kugou", "qq", "amll"],
+        "lxmusic" => &["163", "lrclib", "kugou", "qq", "amll"],
         _ => &["lrclib", "kugou", "qq", "amll"],
     }
 }
 
 pub(super) async fn get_json(url: &str, user_agent: &str) -> Option<Value> {
     get_json_request(HTTP_CLIENT.get(url).header("User-Agent", user_agent)).await
+}
+
+pub(super) async fn get_json_with_timeout(url: &str, timeout: Duration) -> Option<Value> {
+    get_json_request(HTTP_CLIENT.get(url).timeout(timeout)).await
 }
 
 pub(super) async fn get_json_with_referer(
