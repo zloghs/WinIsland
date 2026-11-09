@@ -130,7 +130,12 @@ impl App {
         } else {
             CompactOverlayState::Discard
         };
-        let notification_state = if overlay_present && !fullscreen_hidden {
+        // A notification that arrives while the island hides itself for a fullscreen session is
+        // dropped instead of deferred: deferring keeps it pending until the session ends, and it
+        // then pops out as a stale alert when the island returns.
+        let notification_state = if fullscreen_hidden {
+            CompactOverlayState::Discard
+        } else if overlay_present {
             CompactOverlayState::Present
         } else if !self.expanded && self.hide.has_hidden_reason() {
             CompactOverlayState::Defer

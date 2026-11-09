@@ -93,7 +93,13 @@ impl App {
                     }
                 }
                 HostRequest::Toast { title, body } => {
-                    Self::show_toast(&title, &body);
+                    if self.fullscreen_hide_active() {
+                        // A plugin notification is the same surface as any other toast: it stays
+                        // quiet while the island is hidden for a fullscreen session.
+                        log::info!("Plugin toast suppressed while hidden for fullscreen");
+                    } else {
+                        Self::show_toast(&title, &body);
+                    }
                     PluginStatus::Ok
                 }
                 HostRequest::Command { name, .. } => match name.as_str() {
@@ -146,7 +152,12 @@ impl App {
             self.plugin_alert_revision = alert_revision;
             match alert {
                 Some(alert) => {
-                    if !self.visible || self.fullscreen_hide_active() {
+                    if self.fullscreen_hide_active() {
+                        // The island keeps out of the way in fullscreen, so the alert is dropped
+                        // rather than turned into a system toast the setting asked us to avoid.
+                        log::info!("Plugin alert suppressed while hidden for fullscreen");
+                        host.dismiss_alert();
+                    } else if !self.visible {
                         Self::show_toast(&alert.title, &alert.body);
                         host.dismiss_alert();
                     } else {

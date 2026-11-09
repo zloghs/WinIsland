@@ -15,6 +15,9 @@ impl SettingsApp {
             page.setting(&self.config, AppConfigField::AutoHideDelay, true);
         }
         page.setting(&self.config, AppConfigField::FullscreenAutoHide, true);
+        if self.config.fullscreen_auto_hide {
+            page.row_label(tr("fullscreen_auto_hide_note"));
+        }
         page.push_setting(
             SettingsItem::RowStepper {
                 label: tr("hidden_width"),

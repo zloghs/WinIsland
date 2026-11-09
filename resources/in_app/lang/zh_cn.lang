@@ -153,6 +153,7 @@ font_recommended_note=支持连续字重的苹方可变字体。下载安装后�
 start_boot=开机启动
 auto_hide=无活动时自动隐藏
 fullscreen_auto_hide=全屏时自动隐藏
+fullscreen_auto_hide_note=隐藏期间通知也不会显示。
 hidden_width=隐藏后宽度 (px)
 hidden_width_off=不隐藏
 right_click_drag=右键长按移动
